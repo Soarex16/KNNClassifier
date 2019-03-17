@@ -18,11 +18,13 @@ namespace knn {
      * To improve the readability of the code, a number of types are declared for:
      * feature vector
      * test data labels
-     * metric function
+     * metric (distance) function
+     * weights calculation function
      */
     typedef const std::valarray<double>& featureVec;
     typedef double label;
-    typedef const std::function<double(featureVec, featureVec, const std::valarray<double>&)>& metricFunc;
+    typedef const std::function<double (featureVec, featureVec, const std::valarray<double>&)>& metricFunc;
+    typedef const std::function<std::valarray<double> (const std::valarray<double> &distances)>& weightsFunc;
 
     /**
      * Uniform distribution of neighbors weights
@@ -89,7 +91,7 @@ namespace knn {
        * @return A vector of pairs, where the first component of the pair contains
        * the distances to points, and the second component stores their IDs
        */
-      virtual std::vector<std::pair< std::valarray<double>, std::valarray<int> >> getNeighbors(const std::vector<featureVec>& queryPoints, int k) = 0;
+      virtual std::vector< std::valarray<std::pair<double, int>> > getNeighbors(const std::vector<featureVec>& queryPoints, int k) = 0;
 
       // The following method are needed to establish a bijection between training data, their labels and identifiers.
       virtual label getLabel(int idx) = 0;
@@ -112,10 +114,11 @@ namespace knn {
        * Methods that implement the addition and removal of a set of points from the storage.
        * These methods are necessary because some storage implementations (for example, a KD tree)
        * can work more efficiently (as I think). Also, these methods allow you to implement additional fitting.
-       * @param points point vector to add or remove
+       * @param pointsVec point vector to add or remove
+       * @param labels labels for each point
        */
-      virtual void addPoints(std::vector<featureVec> points) = 0;
-      virtual void deletePoints(std::vector<featureVec> points) = 0;
+      virtual void addPoints(const std::vector<featureVec>& pointsVec, const std::vector<label>& labelsVec) = 0;
+      virtual void deletePoints(const std::vector<featureVec>& pointsVec) = 0;
 
       /**
        * Calculates distance between two points
@@ -127,114 +130,159 @@ namespace knn {
           return metric(p1, p2, metricParams);
       }
 
-      virtual ~PointsStorage() = default;
+      ~PointsStorage() = default;
     };
 
+    /**
+    * Very inefficient storage implementation
+    */
+    class NaiveDataStorage: public PointsStorage {
+     private:
+      std::vector<featureVec> points;
+      std::vector<featureVec> labels;
 
+      // stupidly store the matrix of distances
+      std::vector<std::vector<double>> distances;
+     public:
+      virtual int operator[](featureVec point) {
+          auto it = std::find(points.begin(), points.end(), point);
 
+          return *it;
+      }
 
+      virtual featureVec operator[] (int idx) {
+          return points[idx];
+      }
 
-    void brute(const std::vector<featureVec>& x, int k) {
-        for (size_t i = 0; i < x.size(); ++i) {
-            std::vector<double> distancesToCurrent(x.size() + 1);
-            distancesToCurrent[x.size()] = 0;
+      virtual std::vector< std::valarray<std::pair<double, int>> > getNeighbors(const std::vector<featureVec>& queryPoints, int k) {
+          std::vector< std::valarray<std::pair<double, int>> > result(queryPoints.size());
 
-        }
-    }
+          for (size_t i = 0; i < queryPoints.size(); ++i) {
+              std::valarray< std::pair<double, int> > dists(queryPoints[i].size());
 
+              // get index of a point
+              auto pointIdx = this->operator[](queryPoints[i]);
+
+              // copy dists and indexes, sort them and select first k
+              std::vector<std::pair<double, int>> v(distances[i].size());
+              for (int j = 0; j < distances[i].size(); ++j) {
+                  v[j] = std::make_pair(distances[i][j], j);
+              }
+
+              std::sort(v.begin(), v.end());
+
+              for (size_t j = 1; j <= k; ++j) {
+                  dists[i] = v[j];
+              }
+
+              result[i] = dists;
+          }
+
+          return result;
+      }
+
+      virtual label getLabel(int idx) {
+          return labels[idx];
+      }
+
+      /**
+       * For a good account, it is not necessary to recalculate
+       * the entire table of distances, but only to change its rows and columns,
+       * but since this implementation is purely training, efficiency issues are
+       * not considered here. Perhaps in the future will be optimized.
+       *
+       * Premature optimization is the root of all evil (or at least most of it) in programming.
+       * /~ Donald knuth
+       */
+      virtual void addPoints(const std::vector<featureVec>& pointsVec, const std::vector<label>& labelsVec) {
+          points.insert(points.end(), pointsVec.begin(), pointsVec.end());
+          labels.insert(labels.end(), labelsVec.begin(), labelsVec.end());
+
+          std::vector<std::vector<double>> newDists(points.size());
+
+          for (size_t i = 0; i < points.size(); ++i) {
+              std::vector<double> v(points.size(), 0);
+              newDists[i] = v;
+          }
+
+          // fills the elements above the main diagonal
+          for (size_t i = 0; i < points.size(); ++i) {
+              for (size_t j = i + 1; j < points.size(); ++j) {
+                  newDists[i][j] = distanceBetween(points[i], points[j]);
+              }
+          }
+
+          // because p (x, y) = p (y, x) we just copy the values
+          for (size_t i = 0; i < points.size(); ++i) {
+              for (size_t j = 0; j < i; ++j) {
+                  newDists[i][j] = newDists[j][i];
+              }
+          }
+      }
+
+      virtual void deletePoints(const std::vector<featureVec>& pointsVec) {
+          for (size_t i = 0; i < pointsVec.size(); ++i) {
+              auto idx = this->operator[](pointsVec[i]);
+              points.erase(idx);
+              labels.erase(idx);
+          }
+      }
+
+      ~NaiveDataStorage() = default;
+    };
+
+    /**
+     * Main class of the library
+     * Naive implementation of the K nearest neighbors method
+     */
     class KNeighborsClassifier {
     private:
-        //TODO: ОБУЧАЮЩУЮ ВЫБОРКУ НАДО ВСЕ-ТАКИ ГДЕ-ТО ХРАНИТЬ, ПОЭТОМУ ПРИДЕТСЯ ВСЕ ПЕРЕДЕЛАТЬ (НО ЭТО ХОРОШО,
-        // ПОТОМУ ЧТО АЛГОРИТМЫ СТАНУТ ПРОЩЕ) С УЧЕТОМ ТОГО, ЧТО ДАННЫЕ МЫ ХРАНИМ
-        // ЕСТЬ ОТЛИЧНОЕ ПРЕДЛОЖЕНИЕ ПЕРЕПИСАТЬ НЕКОТОРЫЕ ФУНКЦИИ С НУЛЯ
         int neighborsNum;
-        std::vector<std::vector<double>> distances;
-        std::map<std::valarray<double>, int> datasetMapping;
-        std::vector<double> labels;
-        const std::valarray<double> metricParams;
-
-        std::function<void (const std::vector<std::valarray<double>>& x, std::vector<std::vector<double>>& distances, int k)> nnAlgorithm;
-        std::function<std::valarray<double>(const std::valarray<double>&)> weights;
-        std::function<double(const std::valarray<double>&, const std::valarray<double>&, const std::valarray<double>&)> metric;
+        PointsStorage& points;
+        weightsFunc weights;
 
     public:
-        KNeighborsClassifier(int neighborsNum = 5,
-            std::function<std::valarray<double>(const std::valarray<double>&)> weights = uniformWeights,
-            std::function<void (const std::vector<std::valarray<double>>& x, std::vector<std::vector<double>>& distances, int k)> nnAlgorithm = brute,
-            std::function<double(const std::valarray<double>&, const std::valarray<double>&, const std::valarray<double>&)> metric = minkowskiDistance,
-            std::valarray<double> metricParams = {2.0}) :
-            neighborsNum(neighborsNum), weights(std::move(weights)), nnAlgorithm(std::move(nnAlgorithm)),
-            metric(std::move(metric)), metricParams(std::move(metricParams)) {}
+        KNeighborsClassifier(PointsStorage& pointsStorage, int neighborsNum = 5, weightsFunc w = uniformWeights) :
+            neighborsNum(neighborsNum), points(pointsStorage), weights(w) {}
 
-            // 1 - dists, 2 - idx
-            // indexes are global in this->distances
-            // sorted by distance
-            std::vector<std::pair<std::valarray<double>, std::valarray<int>>> kneighbors(const std::vector<std::valarray<double>>& queryPoints) {
-                std::vector<std::pair<std::valarray<double>, std::valarray<int>>> neighbors(queryPoints.size());
-
-                for (size_t i = 0; i < neighbors.size(); ++i) {
-                    int idx = datasetMapping[queryPoints[i]];
-                    std::vector<std::pair<double, int>> dists(distances[idx].size());
-
-                    for (size_t j = 0; j < distances[idx].size(); ++j) {
-                        dists[j] = std::make_pair(distances[idx][j], j);
-                    }
-
-                    std::sort(dists.begin(), dists.end());
-
-                    for (size_t j = 0; j < neighborsNum; ++j) {
-                        neighbors[i].first[j] = dists[j].first;
-                        neighbors[i].second[j] = dists[j].second;
-                    }
-                }
+            /**
+             * Adds points to point storage, that calculates distances between them
+             * @param x feature vectors of points
+             * @param y true labels
+             */
+            void fit(const std::vector<featureVec>& x, const std::vector<label>& y) {
+                points.addPoints(x, y);
             }
 
-            void fit(const std::vector<std::valarray<double>>& x, const std::valarray<int>& y) {
-                // calculate distances
-                nnAlgorithm(x, y, distances, neighborsNum);
+            /**
+             * Predicts class for each feature vector
+             * @param x data to predict
+             * @return vector of predicted labels
+             */
+            std::vector<label> predict(const std::vector<featureVec>& x) {
+                std::vector<label> prediction;
 
-                // find K nearest neighbors for each point in train data
-                std::vector<std::pair<std::valarray<double>, std::valarray<int>>> neighborsForEveryPoint = kneighbors(x);
-
-                int beginningIdx = labels.size();
-                labels.resize(labels.size(), y.size());
-
-                for(size_t i = 0; i < neighborsForEveryPoint.size(); ++i) {
-                    auto pointData = neighborsForEveryPoint[i];
-
-                    std::map<int, double> weightedDecision;
-
-                    std::valarray<double> neighborsWeights = weights(pointData.first);
-
-                    for (size_t j = 0; i < neighborsWeights.size(); ++i) {
-                        weightedDecision[pointData.second[j]] += neighborsWeights[j];
-                    }
-
-                    auto predictedClass = (*std::max_element(weightedDecision.begin(), weightedDecision.end(),
-                        [](const std::pair<int, double>& p1, std::pair<int, double>& p2) {
-                          return p1.second < p2.second;})).first;
-
-                    datasetMapping[x[i]] = beginningIdx + i;
-                    labels[beginningIdx + i] = predictedClass;
-                }
-            }
-
-            std::vector<int> predict(const std::vector<std::valarray<double>>& x) {
-                std::vector<int> prediction;
-
-                std::vector<std::pair<std::valarray<double>, std::valarray<int>>> neighborsForEveryPoint = kneighbors(x);
+                auto neighborsForEveryPoint = points.getNeighbors(x, neighborsNum);
 
                 for(size_t i = 0; i < neighborsForEveryPoint.size(); ++i) {
+                    // valarray that contains distances to points and their indexes
                     auto pointData = neighborsForEveryPoint[i];
 
-                    std::map<int, double> weightedDecision;
-
-                    std::valarray<double> neighborsWeights = weights(pointData.first);
-
-                    for (size_t j = 0; i < neighborsWeights.size(); ++i) {
-                        weightedDecision[pointData.second[j]] += neighborsWeights[j];
+                    std::valarray<double> neighborsWeights(pointData.size());
+                    for (int j = 0; j < pointData.size(); ++j) {
+                        neighborsWeights[j] = pointData[j].first;
                     }
 
+                    // calculate weights for every neighbor
+                    neighborsWeights = weights(neighborsWeights);
+
+                    std::map<int, double> weightedDecision;
+                    // add to decision weighted values
+                    for (size_t j = 0; i < neighborsWeights.size(); ++i) {
+                        weightedDecision[pointData[j].second] += neighborsWeights[j];
+                    }
+
+                    // find index with maximum value
                     auto predictedClass = (*std::max_element(weightedDecision.begin(), weightedDecision.end(),
                                                              [](const std::pair<int, double>& p1, std::pair<int, double>& p2) {
                                                                return p1.second < p2.second;})).first;
@@ -245,8 +293,21 @@ namespace knn {
                 return prediction;
             }
 
-            double score(const std::vector<std::valarray<double>>& samples, std::vector<double> labels) {
-                std::cout << "WTF?" << std::endl;
+            /**
+             * Returns a score of KNNClassifier
+             * @param samples test data
+             * @param labels true labels
+             * @return MSE
+             */
+            double score(const std::vector<featureVec>& samples, std::vector<double> labels) {
+                auto predicted = predict(samples);
+
+                double sum = 0;
+                for (size_t i = 0; i < predicted.size(); ++i) {
+                    sum += std::pow(predicted[i] - labels[i], 2);
+                }
+
+                return sum / predicted.size();
             }
     };
 }
